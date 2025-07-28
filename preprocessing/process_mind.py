@@ -195,69 +195,6 @@ def write_impression_jsonl_for_users(beh: pd.DataFrame,
     return n_written
 
 
-# ---------------------------
-# Sequential leave-one-out (unchanged)
-# ---------------------------
-def build_click_sequences(beh: pd.DataFrame,
-                          news2idx: Dict[str, int],
-                          user2idx: Dict[str, int]) -> Dict[int, List[int]]:
-    """
-    Returns dict uidx -> sorted list of clicked news indices (positives only),
-    sorted chronologically by dt, then imp_id to stabilize ties.
-    """
-    clicks = defaultdict(list)
-    beh_sorted = beh.sort_values(["user_id", "dt", "imp_id"])
-    for _, r in beh_sorted.iterrows():
-        u = user2idx.get(r["user_id"])
-        if u is None:
-            continue
-        for nid, lab in r["impr_list"]:
-            if lab == 1 and (nid in news2idx):
-                clicks[u].append((r["dt"], r["imp_id"], news2idx[nid]))
-    seq = {}
-    for u, lst in clicks.items():
-        lst.sort(key=lambda x: (x[0], x[1]))
-        seq[u] = [i for _, __, i in lst]
-    return seq
-
-
-def write_seq_inter(u2seq: Dict[int, List[int]], out_dir: str, max_hist_len: int = 50):
-    ensure_dir(out_dir)
-    train_path = os.path.join(out_dir, "train.inter")
-    valid_path = os.path.join(out_dir, "valid.inter")
-    test_path = os.path.join(out_dir, "test.inter")
-
-    with open(train_path, "w") as ftr, \
-         open(valid_path, "w") as fva, \
-         open(test_path, "w") as fte:
-        hdr = "user_id:token\\titem_id_list:token_seq\\titem_id:token\\n"
-        ftr.write(hdr); fva.write(hdr); fte.write(hdr)
-
-        ntr = nva = nte = 0
-        for u, seq in u2seq.items():
-            if len(seq) < 3:
-                # still write train prefixes if any
-                for t in range(1, len(seq)):
-                    hist = seq[:t][-max_hist_len:]
-                    tgt = seq[t]
-                    ftr.write(f"{u}\\t{' '.join(map(str, hist))}\\t{tgt}\\n")
-                    ntr += 1
-                continue
-
-            # train: all prefixes before last two
-            for t in range(1, len(seq) - 2 + 1):
-                hist = seq[:t][-max_hist_len:]
-                tgt = seq[t]
-                ftr.write(f"{u}\\t{' '.join(map(str, hist))}\\t{tgt}\\n")
-                ntr += 1
-
-            # valid: predict second-to-last
-            fva.write(f"{u}\\t{' '.join(map(str, seq[:-2][-max_hist_len:]))}\\t{seq[-2]}\\n"); nva += 1
-            # test : predict last
-            fte.write(f"{u}\\t{' '.join(map(str, seq[:-1][-max_hist_len:]))}\\t{seq[-1]}\\n");  nte += 1
-
-    return {"train": ntr, "valid": nva, "test": nte}
-
 
 # ---------------------------
 # Save indices and text
@@ -337,11 +274,7 @@ def main():
     )
     print(f"  written impressions: train={ntr}, valid={nva}, test={nte}")
 
-    print("[6/6] Building SEQUENTIAL leave-one-out splits (unchanged)...")
-    seq = build_click_sequences(beh, news2idx, user2idx)
-    seq_stats = write_seq_inter(seq, os.path.join(args.out_dir, "seq"),
-                                max_hist_len=args.max_hist_len)
-    print(f"  written sequences: {seq_stats}")
+
 
     print("Saving indices and text...")
     dump_indices_and_text(news, news2idx, user2idx, args.out_dir)
