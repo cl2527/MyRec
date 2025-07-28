@@ -1,368 +1,351 @@
-#!/usr/bin/env python
-"""Pre‑processing script for **MINDsmall** when you ONLY have the
-`MINDsmall_train/` folder (no official dev/test splits).
-
-It builds three kinds of artefacts under an output directory:
-
-1.  *Per‑impression* ranking JSONL files (train/val/test)
-2.  *Sequential* leave‑one‑out `.inter` files (train/val/test)
-3.  Index / auxiliary files (news2index.tsv, user2index.tsv, text, optional
-    entity‑mean features, optional PLM CLS embeddings)
-
-### Splitting strategy
-Because the official `MINDsmall_dev` is missing, we split the **training**
-impressions chronologically **per user**:
-
-```
-first  80 %  → train
-next   10 %  → valid
-latest 10 %  → test
-```
-
-If a user has < 10 impressions, we fall back to a *global* time‑based split.
-
-### Usage
-```bash
-python preprocess_mind_small.py \
-    --in_dir /path/to/MINDsmall_train \
-    --out_dir processed/mindsmall  \
-    --max_hist 50 \
-    --with_plm  --plm_model distilbert-base-uncased  # optional
-```
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+process_mind.py
+Preprocess MINDsmall_train only.
+
+Outputs:
+  processed/mind_small/
+    impr/{train,valid,test}.jsonl          # per-impression ranking (user-level split 80/10/10)
+    seq/{train,valid,test}.inter           # sequential leave-one-out (unchanged from earlier)
+    indices/{user2index.tsv,news2index.tsv}
+    text/news.text
+
+Per-impression split requirement (as requested):
+  - Split USERS (not impressions) into 80%/10%/10% = train/valid/test by a random seed.
+  - DO NOT sort impressions chronologically; keep the order in behaviors.tsv.
+  - For each impression example, the input is the user's history (list of clicked news IDs),
+    and the outputs are candidate news IDs with labels (0/1) from that impression.
+
+Sequential leave-one-out:
+  - Build per-user clicked-news sequences in chronological order and do leave-one-out:
+      * train: all prefix->next pairs except the last two clicks
+      * valid: predict the second-to-last item from its prefix
+      * test : predict the last item from its prefix
+"""
+
 import argparse
 import json
 import os
 import re
-from collections import defaultdict, Counter
+from collections import defaultdict
 from datetime import datetime
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import torch
-from tqdm import tqdm
-
-try:
-    from transformers import AutoTokenizer, AutoModel
-except ImportError:
-    AutoTokenizer = AutoModel = None  # PLM not required unless --with_plm
 
 
 NEWS_COLS = [
-    "news_id",
-    "category",
-    "subcategory",
-    "title",
-    "abstract",
-    "url",
-    "title_entities",
-    "abstract_entities",
+    "news_id", "category", "subcategory", "title", "abstract", "url",
+    "title_entities", "abstract_entities"
 ]
-
-BEH_COLS = [
-    "imp_id",
-    "user_id",
-    "time",
-    "history",
-    "impressions",
-]
-
-DT_FMT = "%m/%d/%Y %I:%M:%S %p"
+BEH_COLS = ["imp_id", "user_id", "time", "history", "impressions"]
+TIME_FMT = "%m/%d/%Y %I:%M:%S %p"   # "MM/DD/YYYY HH:MM:SS AM/PM"
 
 
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
+# ---------------------------
+# Utilities
+# ---------------------------
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
 
-def _clean_text(s: str) -> str:
-    """Basic cleaning for title / abstract."""
+
+def clean_text(s: str) -> str:
     if not isinstance(s, str):
         return ""
-    s = re.sub(r"[\r\n]+", " ", s).strip()
-    return s[:2000]
+    s = re.sub(r"[\\r\\n]+", " ", s).strip()
+    return s[:2000]  # safety cap
 
 
-def _parse_entities(raw: str):
-    """Parse JSON list in title_entities/abstract_entities columns."""
-    if not isinstance(raw, str) or not raw.strip():
+def parse_entities_cell(s: str):
+    if not isinstance(s, str) or not s.strip():
         return []
     try:
-        return json.loads(raw)
+        return json.loads(s)
     except Exception:
-        return json.loads(raw.replace("'", '"'))
+        # some dumps contain single quotes
+        return json.loads(s.replace("'", '"'))
 
 
-def parse_news(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, sep="\t", header=None, names=NEWS_COLS)
-    df = df.drop_duplicates("news_id").set_index("news_id")
-    df["text"] = (df["title"].map(_clean_text) + " " + df["abstract"].map(_clean_text)).str.strip()
-    df["title_entities"] = df["title_entities"].map(_parse_entities)
-    df["abstract_entities"] = df["abstract_entities"].map(_parse_entities)
-    return df
+def parse_history_cell(x: str) -> List[str]:
+    if pd.isna(x) or not x:
+        return []
+    return x.split()
 
 
-def parse_behaviors(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, sep="\t", header=None, names=BEH_COLS)
-
-    def p_hist(x):
-        return [] if pd.isna(x) or not x else x.split()
-
-    def p_impr(x):
-        out = []
-        for tok in x.split():
-            if "-" in tok:
-                nid, lab = tok.split("-")
-                out.append((nid, int(lab)))
-            else:  # should not happen in train but keep for robustness
-                out.append((tok, None))
-        return out
-
-    df["hist_list"] = df["history"].map(p_hist)
-    df["impr_list"] = df["impressions"].map(p_impr)
-    df["dt"] = pd.to_datetime(df["time"], format=DT_FMT)
-    return df
+def parse_impressions_cell(x: str) -> List[Tuple[str, int]]:
+    """Return list of (news_id, label) where label in {0,1} or None if unlabeled."""
+    out = []
+    for tok in x.split():
+        if "-" in tok:
+            nid, lab = tok.split("-")
+            out.append((nid, int(lab)))
+        else:
+            out.append((tok, None))  # test-style (unlabeled); unlikely in MINDsmall_train
+    return out
 
 
-# ---------------------------------------------------------------------------
-# Main processing functions
-# ---------------------------------------------------------------------------
+def parse_time(s: str) -> datetime:
+    return datetime.strptime(s, TIME_FMT)
 
-def build_indices(news_ids: List[str], user_ids: List[str]):
-    news2idx = {nid: i for i, nid in enumerate(sorted(set(news_ids)))}
-    user2idx = {uid: i for i, uid in enumerate(sorted(set(user_ids)))}
+
+# ---------------------------
+# Loaders
+# ---------------------------
+def load_news(in_dir: str) -> pd.DataFrame:
+    path = os.path.join(in_dir, "news.tsv")
+    news = pd.read_csv(path, sep="\\t", header=None, names=NEWS_COLS)
+    news = news.drop_duplicates("news_id").set_index("news_id")
+    news["text"] = (news["title"].map(clean_text) + " " + news["abstract"].map(clean_text)).str.strip()
+    news["title_entities"] = news["title_entities"].map(parse_entities_cell)
+    news["abstract_entities"] = news["abstract_entities"].map(parse_entities_cell)
+    return news
+
+
+def load_behaviors(in_dir: str) -> pd.DataFrame:
+    path = os.path.join(in_dir, "behaviors.tsv")
+    beh = pd.read_csv(path, sep="\\t", header=None, names=BEH_COLS)
+    beh["hist_list"] = beh["history"].map(parse_history_cell)
+    beh["impr_list"] = beh["impressions"].map(parse_impressions_cell)
+    # keep a parsed time column for sequence construction; impressions split does not use it
+    beh["dt"] = beh["time"].map(parse_time)
+    return beh
+
+
+# ---------------------------
+# Indexing
+# ---------------------------
+def build_indices(news: pd.DataFrame, beh: pd.DataFrame):
+    used_news = set(news.index.tolist())
+    seen_news = set()
+    users = set(beh["user_id"].tolist())
+
+    for h in beh["hist_list"]:
+        seen_news.update(h)
+    for im in beh["impr_list"]:
+        for nid, _ in im:
+            seen_news.add(nid)
+
+    used_news = used_news & seen_news
+    news2idx = {nid: i for i, nid in enumerate(sorted(used_news))}
+    user2idx = {uid: i for i, uid in enumerate(sorted(users))}
     return news2idx, user2idx
 
 
-def split_behaviors_user_time(df: pd.DataFrame, val_ratio=0.1, test_ratio=0.1):
-    """Return three DataFrames (train, val, test) using per‑user chronological split."""
-    train_rows, val_rows, test_rows = [], [], []
-
-    for uid, g in df.groupby("user_id"):
-        g_sorted = g.sort_values("dt")
-        n = len(g_sorted)
-        if n < 10:  # fallback: global time split will handle later
-            train_rows.append(g_sorted)
-            continue
-        t_idx = int(n * (1 - test_ratio))
-        v_idx = int(n * (1 - test_ratio - val_ratio))
-        train_rows.append(g_sorted.iloc[:v_idx])
-        val_rows.append(g_sorted.iloc[v_idx:t_idx])
-        test_rows.append(g_sorted.iloc[t_idx:])
-
-    tr = pd.concat(train_rows, ignore_index=True)
-    va = pd.concat(val_rows, ignore_index=True)
-    te = pd.concat(test_rows, ignore_index=True)
-
-    # If some users had <10 impressions, they are only in `tr`. Now do a global split
-    if len(va) == 0 or len(te) == 0:
-        tr = df.sort_values("dt")
-        n = len(tr)
-        t_idx = int(n * (1 - test_ratio))
-        v_idx = int(n * (1 - test_ratio - val_ratio))
-        va = tr.iloc[v_idx:t_idx]
-        te = tr.iloc[t_idx:]
-        tr = tr.iloc[:v_idx]
-    return tr, va, te
+# ---------------------------
+# User-level split for impressions
+# ---------------------------
+def split_users(user_ids: List[str], seed: int, ratios=(0.8, 0.1, 0.1)):
+    assert abs(sum(ratios) - 1.0) < 1e-8, "ratios must sum to 1"
+    rng = np.random.RandomState(seed)
+    order = rng.permutation(len(user_ids))
+    n = len(user_ids)
+    n_tr = int(ratios[0] * n)
+    n_va = int(ratios[1] * n)
+    idx_tr = order[:n_tr]
+    idx_va = order[n_tr:n_tr + n_va]
+    idx_te = order[n_tr + n_va:]
+    tr_users = set(user_ids[i] for i in idx_tr)
+    va_users = set(user_ids[i] for i in idx_va)
+    te_users = set(user_ids[i] for i in idx_te)
+    return tr_users, va_users, te_users
 
 
-def build_impression_jsonl(df: pd.DataFrame, news2idx: Dict[str, int], user2idx: Dict[str, int], out_path: str, max_hist: int = 50):
-    out_path = os.path.abspath(out_path)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+# ---------------------------
+# Dumpers (per-impression ranking)
+# ---------------------------
+def write_impression_jsonl_for_users(beh: pd.DataFrame,
+                                     news2idx: Dict[str, int],
+                                     user2idx: Dict[str, int],
+                                     target_users: set,
+                                     out_path: str,
+                                     max_hist_len: int = 50) -> int:
+    """Write impressions for the selected users. Keep row order as in behaviors.tsv."""
+    ensure_dir(os.path.dirname(out_path))
+    n_written = 0
     with open(out_path, "w") as fw:
-        for _, row in df.iterrows():
-            hist = [news2idx[nid] for nid in row["hist_list"] if nid in news2idx][-max_hist:]
+        for _, r in beh.iterrows():
+            uid = r["user_id"]
+            if uid not in target_users:
+                continue
+
+            hist = [news2idx[n] for n in r["hist_list"] if n in news2idx]
+            hist = hist[-max_hist_len:]
+
             cands, labels = [], []
-            for nid, lab in row["impr_list"]:
+            for nid, lab in r["impr_list"]:
                 if nid in news2idx and lab is not None:
                     cands.append(news2idx[nid])
                     labels.append(int(lab))
+
             if not cands:
                 continue
-            sample = {
-                "imp_id": str(row["imp_id"]),
-                "user_id": user2idx[row["user_id"]],
-                "time": row["time"],
-                "hist": hist,
-                "cands": cands,
-                "labels": labels,
-            }
-            fw.write(json.dumps(sample) + "\n")
+
+            obj = dict(
+                imp_id=str(r["imp_id"]),
+                user_id=int(user2idx[uid]),
+                time=str(r["time"]),   # kept for reference; not used in splitting
+                hist=hist,
+                cands=cands,
+                labels=labels,
+            )
+            fw.write(json.dumps(obj) + "\\n")
+            n_written += 1
+    return n_written
 
 
-def build_seq_leave_one_out(df: pd.DataFrame, news2idx: Dict[str, int], user2idx: Dict[str, int], out_dir: str, max_hist: int = 50):
-    """Write train/val/test .inter files for sequential next‑item prediction."""
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Build click list per user ordered by dt
-    click_per_user = defaultdict(list)
-    for _, row in df.iterrows():
-        for nid, lab in row["impr_list"]:
-            if lab == 1 and nid in news2idx:
-                click_per_user[user2idx[row["user_id"]]].append((row["dt"], news2idx[nid]))
-    for u in click_per_user:
-        click_per_user[u].sort()
-
-    train_f = open(os.path.join(out_dir, "train.inter"), "w")
-    valid_f = open(os.path.join(out_dir, "valid.inter"), "w")
-    test_f  = open(os.path.join(out_dir, "test.inter"), "w")
-
-    header = "user_id:token\titem_id_list:token_seq\titem_id:token\n"
-    for f in (train_f, valid_f, test_f):
-        f.write(header)
-
-    for u, clicks in click_per_user.items():
-        items = [i for _, i in clicks]
-        if len(items) < 3:
+# ---------------------------
+# Sequential leave-one-out (unchanged)
+# ---------------------------
+def build_click_sequences(beh: pd.DataFrame,
+                          news2idx: Dict[str, int],
+                          user2idx: Dict[str, int]) -> Dict[int, List[int]]:
+    """
+    Returns dict uidx -> sorted list of clicked news indices (positives only),
+    sorted chronologically by dt, then imp_id to stabilize ties.
+    """
+    clicks = defaultdict(list)
+    beh_sorted = beh.sort_values(["user_id", "dt", "imp_id"])
+    for _, r in beh_sorted.iterrows():
+        u = user2idx.get(r["user_id"])
+        if u is None:
             continue
-        # leave‑one‑out: last → test, second last → val, others for train seq sliding
-        for t in range(1, len(items)-1):  # up to len-2 for train
-            hist = items[:t][-max_hist:]
-            train_f.write(f"{u}\t{' '.join(map(str, hist))}\t{items[t]}\n")
-        # val
-        valid_f.write(f"{u}\t{' '.join(map(str, items[:-1][-max_hist:]))}\t{items[-1]}\n")
-        # test
-        test_f.write(f"{u}\t{' '.join(map(str, items[-1:][-max_hist:]))}\t{items[-1]}\n")
-
-    for f in (train_f, valid_f, test_f):
-        f.close()
+        for nid, lab in r["impr_list"]:
+            if lab == 1 and (nid in news2idx):
+                clicks[u].append((r["dt"], r["imp_id"], news2idx[nid]))
+    seq = {}
+    for u, lst in clicks.items():
+        lst.sort(key=lambda x: (x[0], x[1]))
+        seq[u] = [i for _, __, i in lst]
+    return seq
 
 
-# ---------------------------------------------------------------------------
-# Optional: PLM and entity embeddings
-# ---------------------------------------------------------------------------
+def write_seq_inter(u2seq: Dict[int, List[int]], out_dir: str, max_hist_len: int = 50):
+    ensure_dir(out_dir)
+    train_path = os.path.join(out_dir, "train.inter")
+    valid_path = os.path.join(out_dir, "valid.inter")
+    test_path = os.path.join(out_dir, "test.inter")
 
-def build_plm_embeddings(news_df: pd.DataFrame, news2idx: Dict[str, int], model_name: str, out_path: str, max_len: int = 128):
-    if AutoTokenizer is None:
-        raise ImportError("transformers not installed. Install it or skip --with_plm option.")
+    with open(train_path, "w") as ftr, \
+         open(valid_path, "w") as fva, \
+         open(test_path, "w") as fte:
+        hdr = "user_id:token\\titem_id_list:token_seq\\titem_id:token\\n"
+        ftr.write(hdr); fva.write(hdr); fte.write(hdr)
 
-    tok = AutoTokenizer.from_pretrained(model_name)
-    mdl = AutoModel.from_pretrained(model_name).cuda()
-    mdl.eval()
+        ntr = nva = nte = 0
+        for u, seq in u2seq.items():
+            if len(seq) < 3:
+                # still write train prefixes if any
+                for t in range(1, len(seq)):
+                    hist = seq[:t][-max_hist_len:]
+                    tgt = seq[t]
+                    ftr.write(f"{u}\\t{' '.join(map(str, hist))}\\t{tgt}\\n")
+                    ntr += 1
+                continue
 
-    texts = [""] * len(news2idx)
-    for nid, idx in news2idx.items():
-        texts[idx] = news_df.loc[nid, "text"]
+            # train: all prefixes before last two
+            for t in range(1, len(seq) - 2 + 1):
+                hist = seq[:t][-max_hist_len:]
+                tgt = seq[t]
+                ftr.write(f"{u}\\t{' '.join(map(str, hist))}\\t{tgt}\\n")
+                ntr += 1
 
-    vecs = []
-    B = 64
-    with torch.no_grad():
-        for i in tqdm(range(0, len(texts), B), desc="PLM encode"):
-            batch_txt = texts[i : i + B]
-            encoded = tok(batch_txt, padding=True, truncation=True, max_length=max_len, return_tensors="pt").to("cuda")
-            out = mdl(**encoded).last_hidden_state[:, 0]  # CLS
-            vecs.append(out.cpu())
-    emb = torch.cat(vecs, 0).numpy().astype("float32")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    emb.tofile(out_path)
+            # valid: predict second-to-last
+            fva.write(f"{u}\\t{' '.join(map(str, seq[:-2][-max_hist_len:]))}\\t{seq[-2]}\\n"); nva += 1
+            # test : predict last
+            fte.write(f"{u}\\t{' '.join(map(str, seq[:-1][-max_hist_len:]))}\\t{seq[-1]}\\n");  nte += 1
 
-
-def build_entity_mean(news_df: pd.DataFrame, news2idx: Dict[str, int], ent_path: str, out_path: str, conf_thr: float = 0.5):
-    ent_vec = {}
-    with open(ent_path) as f:
-        for line in f:
-            t = line.strip().split()
-            ent_vec[t[0]] = np.asarray(list(map(float, t[1:])), dtype="float32")
-    dim = len(next(iter(ent_vec.values())))
-    mat = np.zeros((len(news2idx), dim), dtype="float32")
-    mask = np.zeros((len(news2idx),), dtype=bool)
-
-    def _pool(ent_list):
-        ids = [e["WikidataId"] for e in ent_list if e.get("Confidence", 1.0) >= conf_thr and e.get("WikidataId") in ent_vec]
-        return np.mean([ent_vec[q] for q in ids], axis=0) if ids else None
-
-    for nid, idx in news2idx.items():
-        v = news_df.loc[nid]
-        pooled = _pool(v["title_entities"])  # title + abstract entities combined
-        pooled2 = _pool(v["abstract_entities"])
-        if pooled is None and pooled2 is not None:
-            pooled = pooled2
-        elif pooled is not None and pooled2 is not None:
-            pooled = (pooled + pooled2) / 2
-        if pooled is not None:
-            mat[idx] = pooled
-            mask[idx] = True
-
-    np.save(out_path.replace(".npy", "_mask.npy"), mask)
-    np.save(out_path, mat)
+    return {"train": ntr, "valid": nva, "test": nte}
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# ---------------------------
+# Save indices and text
+# ---------------------------
+def dump_indices_and_text(news: pd.DataFrame,
+                          news2idx: Dict[str, int],
+                          user2idx: Dict[str, int],
+                          out_root: str):
+    ensure_dir(os.path.join(out_root, "indices"))
+    ensure_dir(os.path.join(out_root, "text"))
 
+    with open(os.path.join(out_root, "indices", "news2index.tsv"), "w") as f:
+        for nid, idx in sorted(news2idx.items(), key=lambda x: x[1]):
+            f.write(f"{nid}\\t{idx}\\n")
+
+    with open(os.path.join(out_root, "indices", "user2index.tsv"), "w") as f:
+        for uid, idx in sorted(user2idx.items(), key=lambda x: x[1]):
+            f.write(f"{uid}\\t{idx}\\n")
+
+    with open(os.path.join(out_root, "text", "news.text"), "w") as f:
+        f.write("news_id\\ttext\\n")
+        inv = {v: k for k, v in news2idx.items()}
+        for i in range(len(inv)):
+            nid = inv[i]
+            f.write(f"{nid}\\t{news.loc[nid, 'text']}\\n")
+
+
+# ---------------------------
+# Main
+# ---------------------------
 def main():
-    p = argparse.ArgumentParser(description="Preprocess MINDsmall_train only")
-    p.add_argument("--in_dir", required=True, help="Path to MINDsmall_train directory")
-    p.add_argument("--out_dir", required=True, help="Output root directory")
-    p.add_argument("--max_hist", type=int, default=50, help="History length cap")
-    p.add_argument("--with_plm", action="store_true", help="Encode news text with a PLM and save CLS vectors")
-    p.add_argument("--plm_model", default="distilbert-base-uncased", help="HF model name (used if --with_plm)")
-    p.add_argument("--with_entity", action="store_true", help="Save mean‑pooled entity embeddings per news")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser(description="Preprocess MINDsmall_train into impression and sequence formats.")
+    ap.add_argument("--in_dir", type=str, default="MINDsmall_train",
+                    help="Directory containing behaviors.tsv and news.tsv")
+    ap.add_argument("--out_dir", type=str, default="processed/mind_small",
+                    help="Output root directory")
+    ap.add_argument("--max_hist_len", type=int, default=50,
+                    help="Max history length to keep")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Random seed for user split")
+    ap.add_argument("--user_split", type=float, nargs=3, default=(0.8, 0.1, 0.1),
+                    help="Train/valid/test ratios over users (must sum to 1)")
+    args = ap.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    ensure_dir(args.out_dir)
 
-    # Step 1: News
-    news_path = os.path.join(args.in_dir, "news.tsv")
-    news_df = parse_news(news_path)
+    print("[1/6] Loading news...")
+    news = load_news(args.in_dir)
+    print(f"  news rows: {len(news)}")
 
-    # Step 2: Behaviors
-    beh_path = os.path.join(args.in_dir, "behaviors.tsv")
-    beh_df = parse_behaviors(beh_path)
+    print("[2/6] Loading behaviors...")
+    beh = load_behaviors(args.in_dir)
+    print(f"  impressions: {len(beh)}  users: {beh['user_id'].nunique()}")
 
-    # Step 3: indices
-    news_ids_used = set(news_df.index)
-    user_ids_used = set(beh_df["user_id"].unique())
-    news2idx, user2idx = build_indices(list(news_ids_used), list(user_ids_used))
+    print("[3/6] Building indices...")
+    news2idx, user2idx = build_indices(news, beh)
+    print(f"  indexed news: {len(news2idx)}  indexed users: {len(user2idx)}")
 
-    # Save indices
-    idx_dir = os.path.join(args.out_dir, "indices")
-    os.makedirs(idx_dir, exist_ok=True)
-    with open(os.path.join(idx_dir, "news2index.tsv"), "w") as f:
-        for nid, idx in news2idx.items():
-            f.write(f"{nid}\t{idx}\n")
-    with open(os.path.join(idx_dir, "user2index.tsv"), "w") as f:
-        for uid, idx in user2idx.items():
-            f.write(f"{uid}\t{idx}\n")
+    print("[4/6] Splitting USERS (80/10/10 by default)...")
+    user_ids = sorted(user2idx.keys())
+    tr_users, va_users, te_users = split_users(user_ids, seed=args.seed, ratios=tuple(args.user_split))
+    print(f"  users -> train={len(tr_users)} valid={len(va_users)} test={len(te_users)}")
 
-    # Step 4: Split behaviors
-    tr_beh, va_beh, te_beh = split_behaviors_user_time(beh_df)
-
-    # Step 5: Impression JSONL
+    print("[5/6] Writing PER-IMPRESSION jsonl (keep behaviors order)...")
     impr_dir = os.path.join(args.out_dir, "impr")
-    build_impression_jsonl(tr_beh, news2idx, user2idx, os.path.join(impr_dir, "train.jsonl"), args.max_hist)
-    build_impression_jsonl(va_beh, news2idx, user2idx, os.path.join(impr_dir, "valid.jsonl"), args.max_hist)
-    build_impression_jsonl(te_beh, news2idx, user2idx, os.path.join(impr_dir, "test.jsonl"), args.max_hist)
+    ntr = write_impression_jsonl_for_users(
+        beh, news2idx, user2idx, tr_users, os.path.join(impr_dir, "train.jsonl"),
+        max_hist_len=args.max_hist_len
+    )
+    nva = write_impression_jsonl_for_users(
+        beh, news2idx, user2idx, va_users, os.path.join(impr_dir, "valid.jsonl"),
+        max_hist_len=args.max_hist_len
+    )
+    nte = write_impression_jsonl_for_users(
+        beh, news2idx, user2idx, te_users, os.path.join(impr_dir, "test.jsonl"),
+        max_hist_len=args.max_hist_len
+    )
+    print(f"  written impressions: train={ntr}, valid={nva}, test={nte}")
 
-    # Step 6: Sequential leave‑one‑out
-    seq_dir = os.path.join(args.out_dir, "seq")
-    build_seq_leave_one_out(beh_df, news2idx, user2idx, seq_dir, args.max_hist)
+    print("[6/6] Building SEQUENTIAL leave-one-out splits (unchanged)...")
+    seq = build_click_sequences(beh, news2idx, user2idx)
+    seq_stats = write_seq_inter(seq, os.path.join(args.out_dir, "seq"),
+                                max_hist_len=args.max_hist_len)
+    print(f"  written sequences: {seq_stats}")
 
-    # Step 7: Save cleaned text
-    text_dir = os.path.join(args.out_dir, "text")
-    os.makedirs(text_dir, exist_ok=True)
-    with open(os.path.join(text_dir, "news.text"), "w") as f:
-        f.write("news_id\ttext\n")
-        for nid in sorted(news2idx.keys()):
-            f.write(f"{nid}\t{news_df.loc[nid,'text']}\n")
-
-    # Optional PLM
-    if args.with_plm:
-        build_plm_embeddings(
-            news_df, news2idx, args.plm_model,
-            out_path=os.path.join(args.out_dir, "emb", "mind_cls.bin"),
-        )
-
-    # Optional entity mean
-    if args.with_entity:
-        build_entity_mean(
-            news_df, news2idx,
-            ent_path=os.path.join(args.in_dir, "entity_embedding.vec"),
-            out_path=os.path.join(args.out_dir, "kg", "news_entity_mean.npy"),
-        )
-
-    print("\nPreprocessing complete. Outputs written to:", args.out_dir)
+    print("Saving indices and text...")
+    dump_indices_and_text(news, news2idx, user2idx, args.out_dir)
+    print("Done.")
 
 
 if __name__ == "__main__":
