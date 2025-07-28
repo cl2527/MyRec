@@ -283,3 +283,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+"""
+
+python process_mind_v2.py \
+  --in_dir MINDsmall_train \
+  --out_dir processed/mind_small \
+  --max_hist_len 50 \
+  --seed 42 \
+  --user_split 0.8 0.1 0.1
+"""
